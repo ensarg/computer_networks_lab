@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Java
+*.class
+*.jar
+
+# TLS certificates / keystores
+*.pem
+*.p12
+*.jks
+
+# macOS
+.DS_Store
