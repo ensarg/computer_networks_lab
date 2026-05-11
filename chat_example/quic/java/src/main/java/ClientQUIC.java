@@ -2,8 +2,6 @@
  * ClientQUIC.java — Java QUIC Chat Client
  * Computer Networks Lab
  *
- * Connects to the QUIC chat server on port 4434.
- *
  * Build:  cd quic_java && mvn package -q
  * Run:    java -cp target/quic-chat-1.0-jar-with-dependencies.jar ClientQUIC
  */
@@ -12,72 +10,86 @@ import tech.kwik.core.QuicClientConnection;
 import tech.kwik.core.QuicStream;
 
 import java.io.*;
-import java.net.URI;
 
+// ── Entry point ───────────────────────────────────────────────────────────────
 public class ClientQUIC {
-
-    static final String HOST = "localhost";
-    static final int    PORT = 4434;
-    static final String ALPN = "chat";   // must match the server's registered protocol
-
     public static void main(String[] args) throws Exception {
+        String username = new UserInputReader().readUsername();
+        new QuicChatClient("localhost", 4434, "chat").connect(username);
+    }
+}
 
+// ── UserInputReader ───────────────────────────────────────────────────────────
+/**
+ * Prompts the user for a display name on stdin.
+ */
+class UserInputReader {
+
+    String readUsername() throws IOException {
         BufferedReader stdin = new BufferedReader(new InputStreamReader(System.in));
         System.out.print("Enter your name: ");
-        String username = stdin.readLine().trim();
-        if (username.isEmpty()) username = "anonymous";
+        String name = stdin.readLine().trim();
+        return name.isEmpty() ? "anonymous" : name;
+    }
+}
 
-        System.out.println("[client] connecting to " + HOST + ":" + PORT + " …");
+// ── QuicChatClient ────────────────────────────────────────────────────────────
+/**
+ * Connects to the QUIC chat server and manages the session.
+ *
+ * After connect():
+ *   - IncomingMessageHandler handles server-pushed broadcasts (one thread per stream).
+ *   - sendLoop() reads stdin and writes to the outgoing bidirectional stream.
+ */
+class QuicChatClient {
 
-        // ── build and open the QUIC connection ────────────────────────────────
+    private final String host;
+    private final int    port;
+    private final String alpn;
+
+    QuicChatClient(String host, int port, String alpn) {
+        this.host = host;
+        this.port = port;
+        this.alpn = alpn;
+    }
+
+    void connect(String username) throws Exception {
+        System.out.println("[client] connecting to " + host + ":" + port + " ...");
+
         QuicClientConnection connection = QuicClientConnection.newBuilder()
-                .host(HOST)
-                .port(PORT)
-                .applicationProtocol(ALPN)   // ALPN tells the server which app we speak
-                .noServerCertificateCheck()  // skip cert validation — OK for classroom demo
-                // Allow the server to push up to 100 unidirectional streams (broadcasts)
-                .maxOpenPeerInitiatedUnidirectionalStreams(100)
+                .host(host)
+                .port(port)
+                .applicationProtocol(alpn)
+                .noServerCertificateCheck()                     // OK for classroom demo
+                .maxOpenPeerInitiatedUnidirectionalStreams(100)  // allow server broadcasts
                 .build();
 
-        // Register a callback: called whenever the server opens a new stream toward us.
-        // The server uses these unidirectional streams to push broadcast messages.
-        connection.setPeerInitiatedStreamCallback(stream -> {
-            Thread t = new Thread(() -> {
-                try (BufferedReader reader =
-                             new BufferedReader(new InputStreamReader(stream.getInputStream()))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        if (!line.isEmpty()) {
-                            System.out.print("\r" + line + "\n> ");
-                        }
-                    }
-                } catch (IOException e) {
-                    // stream closed
-                }
-            });
-            t.setDaemon(true);
-            t.start();
-        });
+        // Register handler for server-initiated broadcast streams
+        connection.setPeerInitiatedStreamCallback(new IncomingMessageHandler());
 
-        // Perform the QUIC handshake (includes TLS 1.3 — faster than TCP + TLS)
-        connection.connect();
+        connection.connect();   // QUIC + TLS 1.3 handshake
 
         System.out.println("[client] connected!  You are '" + username + "'");
         System.out.println("[client] type a message and press Enter.  'quit' to exit.\n");
 
-        // ── open a bidirectional stream for sending messages to the server ────
-        QuicStream stream = connection.createStream(true);
+        QuicStream stream = connection.createStream(true);   // bidirectional
         PrintWriter writer = new PrintWriter(
                 new BufferedWriter(new OutputStreamWriter(stream.getOutputStream())), true);
 
-        // First message registers our display name on the server
-        writer.println(username);
+        writer.println(username);   // first message registers the display name
 
-        // ── read stdin and send lines ─────────────────────────────────────────
+        sendLoop(writer);
+
+        connection.closeAndWait();
+        System.out.println("\n[client] disconnected.");
+    }
+
+    private void sendLoop(PrintWriter writer) throws IOException {
+        BufferedReader stdin = new BufferedReader(new InputStreamReader(System.in));
         while (true) {
             System.out.print("> ");
             String line = stdin.readLine();
-            if (line == null) break;   // EOF (Ctrl-D)
+            if (line == null) break;
             line = line.trim();
             if (line.equalsIgnoreCase("quit") ||
                 line.equalsIgnoreCase("exit") ||
@@ -86,8 +98,43 @@ public class ClientQUIC {
                 writer.println(line);
             }
         }
+    }
+}
 
-        connection.closeAndWait();
-        System.out.println("\n[client] disconnected.");
+// ── IncomingMessageHandler ────────────────────────────────────────────────────
+/**
+ * Called by kwik whenever the server opens a new unidirectional stream toward
+ * this client. Reads the message and prints it to the terminal.
+ */
+class IncomingMessageHandler implements java.util.function.Consumer<QuicStream> {
+
+    @Override
+    public void accept(QuicStream stream) {
+        Thread t = new Thread(new StreamPrinter(stream));
+        t.setDaemon(true);
+        t.start();
+    }
+
+    // ── inner: reads one stream and prints its content ────────────────────────
+    private static class StreamPrinter implements Runnable {
+
+        private final QuicStream stream;
+
+        StreamPrinter(QuicStream stream) { this.stream = stream; }
+
+        @Override
+        public void run() {
+            try (BufferedReader reader =
+                         new BufferedReader(new InputStreamReader(stream.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (!line.isEmpty()) {
+                        System.out.print("\r" + line + "\n> ");
+                    }
+                }
+            } catch (IOException e) {
+                // Stream closed
+            }
+        }
     }
 }
